@@ -8000,7 +8000,8 @@
         "__uuid__": "657057f0-78fa-4b74-b634-e60b413d4d67"
       }
     ],
-    "coinCount": 64,
+    "coinCount": 150,
+    "coinDisplayHeight": 16,
     "_id": "2fML8sMc9F65IB1yRHqTxC"
   }
 ]

@@ -4,7 +4,8 @@ const { ccclass, property } = cc._decorator;
 
 /** Q2：场景提供美术和碰撞轮廓，掉落在 main 的本地坐标中求解。 */
 const PHYSICS_STEP = 1 / 60;
-const MAX_FRAME_STEPS = 2;
+// 一帧只补一次物理步。卡顿时不追帧，避免补步把下一帧再拖垮。
+const MAX_FRAME_STEPS = 1;
 const ROLL_START_SPEED = 24;
 const ROLL_SPEED_BASE = 300;
 const COIN_FRAME_RATE = 18;
@@ -16,8 +17,8 @@ const IDLE_DEADLOCK = 0.7;
 // 所有针仍在位时，开局落完后不必持续模拟封闭上仓里的堆叠抖动。
 const INITIAL_SETTLE_TIME = 2.1;
 const JAR_REACH = { left: -96, right: -40, top: -250, bottom: -330 };
-const DEFAULT_COIN_COUNT = 64;
-const MAX_COIN_COUNT = 140;
+const DEFAULT_COIN_COUNT = 150;
+const MAX_COIN_COUNT = 150;
 const MAX_COIN_DISPLAY_HEIGHT = 17;
 const JAR_COIN_RADIUS = 3.5; // 入瓶后缩小接触半径，避免大批金币在瓶口上方堆回出口。
 const GUIDE_THICKNESS = 8;
@@ -27,6 +28,8 @@ const OUTLET_RIGHT = { x: -60, y: -183 };
 // 上仓的取样范围；实际落点仍需避开场景轮廓。
 const COIN_SPAWN = { left: -100, right: 102, bottom: 32, top: 172 };
 const COIN_LOST_Y = -400;
+const ROLL_WRITES_PER_FRAME = 24;
+const POSITION_EPSILON_SQ = 0.04;
 
 type Result = "win" | "lost" | "stuck";
 
@@ -116,6 +119,8 @@ export default class Q2 extends cc.Component {
     private idle = 0;
     private initialSettleTime = 0;
     private allInJarTime = 0;
+    private frameWrites = 0;
+    private frameCursor = 0;
     private tip!: cc.Label;
     private gridW = 0;
     private gridH = 0;
@@ -243,7 +248,7 @@ export default class Q2 extends cc.Component {
             const { width, height } = collider.size;
             const { x, y } = collider.offset;
             const corners = [cc.v2(x - width / 2, y - height / 2), cc.v2(x + width / 2, y - height / 2),
-                cc.v2(x + width / 2, y + height / 2), cc.v2(x - width / 2, y + height / 2)];
+            cc.v2(x + width / 2, y + height / 2), cc.v2(x - width / 2, y + height / 2)];
             this.drop.addOutline(corners.map(p => this.main.convertToNodeSpaceAR(node.convertToWorldSpaceAR(p))), rod);
             this.rods.push(rod);
             node.on(cc.Node.EventType.TOUCH_END, () => this.pull(rod), this);
@@ -262,7 +267,9 @@ export default class Q2 extends cc.Component {
             return;
         }
         const count = Math.max(1, Math.min(MAX_COIN_COUNT, Math.floor(this.coinCount)));
-        const positions = this.sampleCoinPositions(count, colliderTemplate.radius);
+        const radius = colliderTemplate.radius;
+        this.stripPhysics(template);
+        const positions = this.sampleCoinPositions(count, radius);
         if (positions.length !== count) cc.error("Q2: 上仓空间不足，无法放下全部金币", positions.length, count);
         while (nodes.length < positions.length) {
             const clone = cc.instantiate(template);
@@ -278,8 +285,8 @@ export default class Q2 extends cc.Component {
             const world = this.main.convertToWorldSpaceAR(positions[i]);
             node.setPosition(root.convertToNodeSpaceAR(world));
             if (!node.parent) node.parent = root;
+            this.stripPhysics(node);
             const source = node.getComponent(cc.Sprite);
-            this.disablePhysics(node);
             if (!source) {
                 cc.error("Q2: 金币缺少贴图组件", node.name);
                 continue;
@@ -291,10 +298,19 @@ export default class Q2 extends cc.Component {
             const frame = this.frames.length ? this.frames[i % this.frames.length] : source.spriteFrame;
             if (frame) this.setCoinFrame(source, frame);
             const pos = positions[i];
-            this.coins.push({ node, sprite: source, rollFrame: i, inJar: false, lost: false,
+            this.coins.push({
+                node, sprite: source, rollFrame: i, inJar: false, lost: false,
                 x: pos.x, y: pos.y, previousX: pos.x, previousY: pos.y,
-                vx: 0, vy: 0, radius: colliderTemplate.radius });
+                vx: 0, vy: 0, radius, awake: true, still: 0
+            });
         }
+    }
+
+    private stripPhysics(node: cc.Node) {
+        const colliders = node.getComponents(cc.PhysicsCollider);
+        for (let i = colliders.length - 1; i >= 0; i--) node.removeComponent(colliders[i]);
+        const body = node.getComponent(cc.RigidBody);
+        if (body) node.removeComponent(body);
     }
 
     private sampleCoinPositions(count: number, radius: number): cc.Vec2[] {
@@ -302,38 +318,49 @@ export default class Q2 extends cc.Component {
         if (!wall) return [];
         const positions: cc.Vec2[] = [];
         const clearance = radius + 1;
-        const minGapSq = (2 * radius + 0.5) ** 2;
+        const minGap = 2 * radius + 0.5;
+        const minGapSq = minGap * minGap;
         const { left, right, bottom, top } = COIN_SPAWN;
-        for (let attempt = 0; attempt < count * 100 && positions.length < count; attempt++) {
-            const x = left + Math.random() * (right - left);
-            const y = bottom + Math.random() * (top - bottom);
-            let innerLeft = -Infinity;
-            let innerRight = Infinity;
-            let touchesWall = false;
-            for (let i = 0, j = wall.length - 1; i < wall.length; j = i++) {
-                const a = wall[j];
-                const b = wall[i];
-                const dx = b.x - a.x;
-                const dy = b.y - a.y;
-                // 上仓横截面包含 x = 0，只取最靠近它的左右内壁。
-                if ((a.y > y) !== (b.y > y)) {
-                    const edgeX = a.x + (y - a.y) * dx / dy;
-                    if (edgeX < 0) innerLeft = Math.max(innerLeft, edgeX);
-                    else innerRight = Math.min(innerRight, edgeX);
-                }
-                const t = Math.max(0, Math.min(1,
-                    ((x - a.x) * dx + (y - a.y) * dy) / (dx * dx + dy * dy),
-                ));
-                if ((x - a.x - t * dx) ** 2 + (y - a.y - t * dy) ** 2 < clearance ** 2) {
-                    touchesWall = true;
-                    break;
-                }
-            }
-            if (touchesWall || !isFinite(innerLeft) || !isFinite(innerRight) || x <= innerLeft || x >= innerRight) continue;
-            if (positions.some(p => (p.x - x) ** 2 + (p.y - y) ** 2 < minGapSq)) continue;
+        const place = (x: number, y: number) => {
+            if (!this.fitsCoin(wall, x, y, clearance, positions, minGapSq)) return;
             positions.push(cc.v2(x, y));
+        };
+        // 先按网格铺满，避免 150 次随机拒绝采样在开局卡住主线程。
+        for (let y = top - radius; y >= bottom + radius && positions.length < count; y -= minGap) {
+            const shift = Math.round((top - y) / minGap) % 2 ? minGap * 0.5 : 0;
+            for (let x = left + radius + shift; x <= right - radius && positions.length < count; x += minGap) {
+                place(x, y);
+            }
+        }
+        for (let attempt = 0; attempt < count * 40 && positions.length < count; attempt++) {
+            place(left + Math.random() * (right - left), bottom + Math.random() * (top - bottom));
         }
         return positions;
+    }
+
+    private fitsCoin(wall: cc.Vec2[], x: number, y: number, clearance: number, positions: cc.Vec2[], minGapSq: number): boolean {
+        let innerLeft = -Infinity;
+        let innerRight = Infinity;
+        for (let i = 0, j = wall.length - 1; i < wall.length; j = i++) {
+            const a = wall[j];
+            const b = wall[i];
+            const dx = b.x - a.x;
+            const dy = b.y - a.y;
+            if ((a.y > y) !== (b.y > y)) {
+                const edgeX = a.x + (y - a.y) * dx / dy;
+                if (edgeX < 0) innerLeft = Math.max(innerLeft, edgeX);
+                else innerRight = Math.min(innerRight, edgeX);
+            }
+            const lenSq = dx * dx + dy * dy;
+            const t = lenSq > 0 ? Math.max(0, Math.min(1, ((x - a.x) * dx + (y - a.y) * dy) / lenSq)) : 0;
+            if ((x - a.x - t * dx) ** 2 + (y - a.y - t * dy) ** 2 < clearance * clearance) return false;
+        }
+        if (!isFinite(innerLeft) || !isFinite(innerRight) || x <= innerLeft || x >= innerRight) return false;
+        for (let i = 0; i < positions.length; i++) {
+            const placed = positions[i];
+            if ((placed.x - x) ** 2 + (placed.y - y) ** 2 < minGapSq) return false;
+        }
+        return true;
     }
 
     private setCoinFrame(sprite: cc.Sprite, frame: cc.SpriteFrame) {
@@ -381,6 +408,7 @@ export default class Q2 extends cc.Component {
                 this.sleeping = false;
                 this.idle = 0;
                 this.allInJarTime = 0;
+                this.drop.wakeAbove(this.coins, this.bottleMouthY);
             })
             .to(PIN_EXIT_TIME, { x: out.x, y: out.y }, { easing: "sineOut" })
             .call(() => { node.active = false; })
@@ -416,13 +444,18 @@ export default class Q2 extends cc.Component {
             this.drop.step(this.coins, PHYSICS_STEP);
         }
         if (!simulated) return;
+        this.frameWrites = 0;
         let lost = false;
         let allInJar = true;
-        for (const coin of this.coins) {
+        const total = this.coins.length;
+        const start = total ? this.frameCursor % total : 0;
+        for (let i = 0; i < total; i++) {
+            const coin = this.coins[(start + i) % total];
             this.paintCoin(coin, simulated);
             lost = lost || coin.lost;
             allInJar = allInJar && coin.y <= this.bottleMouthY;
         }
+        this.frameCursor = (start + ROLL_WRITES_PER_FRAME) % Math.max(1, total);
         if (this.pendingPulls) return;
         if (lost) {
             this.judge();
@@ -476,15 +509,22 @@ export default class Q2 extends cc.Component {
             const cavity = this.bottleInteriorAt(coin.y);
             if (cavity && coin.x >= cavity.left && coin.x <= cavity.right) coin.radius = JAR_COIN_RADIUS;
         }
-        // 金币容器与 main 同原点；只有坐标变化才写回渲染节点。
-        if (coin.node.x !== coin.x || coin.node.y !== coin.y) coin.node.setPosition(coin.x, coin.y);
-        const speedSq = coin.vx * coin.vx + coin.vy * coin.vy;
-        if (this.frames.length > 1 && speedSq >= ROLL_START_SPEED * ROLL_START_SPEED) {
-            const speed = Math.sqrt(speedSq);
-            coin.rollFrame = (coin.rollFrame + dt * COIN_FRAME_RATE * speed / ROLL_SPEED_BASE) % this.frames.length;
-            const frame = this.frames[Math.floor(coin.rollFrame)];
-            if (coin.sprite.spriteFrame !== frame) this.setCoinFrame(coin.sprite, frame);
+        if (!coin.awake) {
+            if (coin.node.x !== coin.x || coin.node.y !== coin.y) coin.node.setPosition(coin.x, coin.y);
+            return;
         }
+        const dx = coin.x - coin.node.x;
+        const dy = coin.y - coin.node.y;
+        if (dx * dx + dy * dy >= POSITION_EPSILON_SQ) coin.node.setPosition(coin.x, coin.y);
+        const speedSq = coin.vx * coin.vx + coin.vy * coin.vy;
+        if (this.frames.length <= 1 || speedSq < ROLL_START_SPEED * ROLL_START_SPEED) return;
+        const speed = Math.sqrt(speedSq);
+        coin.rollFrame = (coin.rollFrame + dt * COIN_FRAME_RATE * speed / ROLL_SPEED_BASE) % this.frames.length;
+        if (this.frameWrites >= ROLL_WRITES_PER_FRAME) return;
+        const frame = this.frames[Math.floor(coin.rollFrame)];
+        if (coin.sprite.spriteFrame === frame) return;
+        this.frameWrites++;
+        this.setCoinFrame(coin.sprite, frame);
     }
 
     private bottleInteriorAt(y: number): { left: number; right: number } | null {

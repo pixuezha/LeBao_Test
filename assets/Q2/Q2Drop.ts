@@ -9,6 +9,11 @@ const EPSILON = 1e-8;
 const GRAVITY = 1200;
 const MAX_SPEED = 300;
 const MAX_SPEED_SQ = MAX_SPEED * MAX_SPEED;
+const SLEEP_SPEED = 6;
+const SLEEP_SPEED_SQ = SLEEP_SPEED * SLEEP_SPEED;
+const SLEEP_FRAMES = 6;
+const WAKE_PAD = 2;
+const COIN_CAP = 160;
 
 export interface DropCoin {
     x: number;
@@ -19,6 +24,8 @@ export interface DropCoin {
     lost: boolean;
     previousX: number;
     previousY: number;
+    awake: boolean;
+    still: number;
 }
 
 export interface DropGate { open: boolean; }
@@ -37,7 +44,7 @@ function row(y: number) { return Math.floor((y - GRID_BOTTOM) / CELL); }
 export class Q2Drop {
     private readonly edges: Edge[][] = Array.from({ length: COLS * ROWS }, () => []);
     private readonly heads = new Int16Array(COLS * ROWS);
-    private readonly links = new Int16Array(140);
+    private links = new Int16Array(COIN_CAP);
     private readonly occupied: number[] = [];
     private queryId = 0;
     private hitTime = 1;
@@ -69,12 +76,32 @@ export class Q2Drop {
         }
     }
 
-    // 固定步重力；位置修正也走扫描碰撞，避免挤成一团时把金币挤到挡针背面。
+    /** 瓶外的金币重新参与求解；已经进瓶并睡着的不叫醒。 */
+    wakeAbove(coins: ReadonlyArray<DropCoin>, y: number) {
+        for (let i = 0; i < coins.length; i++) {
+            const coin = coins[i];
+            if (coin.lost || coin.y < y) continue;
+            coin.awake = true;
+            coin.still = 0;
+        }
+    }
+
+    private ensure(count: number) {
+        if (count <= this.links.length) return;
+        this.links = new Int16Array(count);
+    }
+
+    // 睡着的金币不积分。堆叠修正不再做连续扫描，只有贴着边的金币才离散推出。
     step(coins: ReadonlyArray<DropCoin>, dt: number): number {
-        for (const coin of coins) {
+        this.ensure(coins.length);
+        let awake = 0;
+        for (let i = 0; i < coins.length; i++) {
+            const coin = coins[i];
             if (coin.lost) continue;
             coin.previousX = coin.x;
             coin.previousY = coin.y;
+            if (!coin.awake) continue;
+            awake++;
             coin.vx *= 0.995;
             coin.vy -= GRAVITY * dt;
             const speedSq = coin.vx * coin.vx + coin.vy * coin.vy;
@@ -85,16 +112,24 @@ export class Q2Drop {
             }
             this.move(coin, coin.vx * dt, coin.vy * dt, true);
         }
+        if (!awake) return 0;
         for (let pass = 0; pass < 4; pass++) this.separate(coins);
         let maxMotionSq = 0;
-        for (const coin of coins) {
-            if (coin.lost) continue;
+        for (let i = 0; i < coins.length; i++) {
+            const coin = coins[i];
+            if (coin.lost || !coin.awake) continue;
             const dx = coin.x - coin.previousX;
             const dy = coin.y - coin.previousY;
-            // 位置迭代消掉堆叠压力，不把分离位移变成下一步的动能。
             coin.vx = this.constrainedVelocity(coin.vx, dx / dt) * 0.98;
             coin.vy = this.constrainedVelocity(coin.vy, dy / dt) * 0.98;
-            maxMotionSq = Math.max(maxMotionSq, dx * dx + dy * dy);
+            const speedSq = coin.vx * coin.vx + coin.vy * coin.vy;
+            if (speedSq < SLEEP_SPEED_SQ) {
+                coin.still++;
+                if (coin.still >= SLEEP_FRAMES) coin.awake = false;
+            } else {
+                coin.still = 0;
+            }
+            if (dx * dx + dy * dy > maxMotionSq) maxMotionSq = dx * dx + dy * dy;
         }
         return maxMotionSq;
     }
@@ -121,17 +156,38 @@ export class Q2Drop {
         }
         for (let i = 0; i < coins.length; i++) {
             const a = coins[i];
-            if (a.lost) continue;
+            if (a.lost || !a.awake) continue;
+            const mx = a.x - a.previousX;
+            const my = a.y - a.previousY;
+            const stirring = mx * mx + my * my > 0.04;
             const gx = column(a.x);
             const gy = row(a.y);
             for (let y = Math.max(0, gy - 1); y <= Math.min(ROWS - 1, gy + 1); y++) {
                 for (let x = Math.max(0, gx - 1); x <= Math.min(COLS - 1, gx + 1); x++) {
-                    for (let j = this.heads[y * COLS + x]; j > i; j = this.links[j]) {
-                        this.separatePair(a, coins[j]);
+                    for (let j = this.heads[y * COLS + x]; j >= 0; j = this.links[j]) {
+                        if (j === i) continue;
+                        const b = coins[j];
+                        if (b.awake) {
+                            if (j < i) continue;
+                        } else if (stirring) {
+                            this.wakeSupported(a, b);
+                        }
+                        this.separatePair(a, b);
                     }
                 }
             }
         }
+    }
+
+    /** 正在下落的金币叫醒可能压在它上面的邻居，堆叠才会跟着塌，而不是整仓一起醒。 */
+    private wakeSupported(mover: DropCoin, other: DropCoin) {
+        const dy = other.y - mover.y;
+        if (dy < -1) return;
+        const dx = other.x - mover.x;
+        const reach = mover.radius + other.radius + WAKE_PAD;
+        if (dx * dx + dy * dy > reach * reach) return;
+        other.awake = true;
+        other.still = 0;
     }
 
     private separatePair(a: DropCoin, b: DropCoin) {
@@ -143,15 +199,15 @@ export class Q2Drop {
         const dist = Math.sqrt(distSq);
         const nx = dist > EPSILON ? dx / dist : 1;
         const ny = dist > EPSILON ? dy / dist : 0;
-        // 允许少量接触重叠，避免密集堆叠的修正把相邻金币来回弹开。
         const correction = Math.min(0.45, (gap - dist) * 0.35);
-        // 同一道实体薄边两侧的金币不该彼此支撑：推不到接触方向就不传递速度。
         const ax = a.x;
         const ay = a.y;
         const bx = b.x;
         const by = b.y;
-        this.move(a, -nx * correction, -ny * correction, false);
-        this.move(b, nx * correction, ny * correction, false);
+        this.nudge(a, -nx * correction, -ny * correction);
+        this.nudge(b, nx * correction, ny * correction);
+        if (!a.awake) { a.awake = true; a.still = 0; }
+        if (!b.awake) { b.awake = true; b.still = 0; }
         if ((b.x - bx - a.x + ax) * nx + (b.y - by - a.y + ay) * ny < SKIN) return;
         const closing = (a.vx - b.vx) * nx + (a.vy - b.vy) * ny;
         if (closing <= 0) return;
@@ -162,7 +218,92 @@ export class Q2Drop {
         b.vy += ny * impulse;
     }
 
+    /** 修正量小于针厚，离散推出不会穿到挡针背面；空单元格直接跳过。 */
+    private nudge(coin: DropCoin, dx: number, dy: number) {
+        coin.x += dx;
+        coin.y += dy;
+        if (this.nearEdge(coin.x, coin.y, coin.radius)) this.clampOut(coin);
+    }
+
+    private nearEdge(x: number, y: number, radius: number): boolean {
+        const x0 = Math.max(0, column(x - radius));
+        const x1 = Math.min(COLS - 1, column(x + radius));
+        const y0 = Math.max(0, row(y - radius));
+        const y1 = Math.min(ROWS - 1, row(y + radius));
+        for (let gy = y0; gy <= y1; gy++) {
+            for (let gx = x0; gx <= x1; gx++) {
+                if (this.edges[gy * COLS + gx].length) return true;
+            }
+        }
+        return false;
+    }
+
+    private clampOut(coin: DropCoin) {
+        const radius = coin.radius;
+        for (let iter = 0; iter < 2; iter++) {
+            const id = ++this.queryId;
+            let pushed = false;
+            const x0 = Math.max(0, column(coin.x - radius));
+            const x1 = Math.min(COLS - 1, column(coin.x + radius));
+            const y0 = Math.max(0, row(coin.y - radius));
+            const y1 = Math.min(ROWS - 1, row(coin.y + radius));
+            for (let gy = y0; gy <= y1; gy++) {
+                for (let gx = x0; gx <= x1; gx++) {
+                    const bucket = this.edges[gy * COLS + gx];
+                    for (let e = 0; e < bucket.length; e++) {
+                        const edge = bucket[e];
+                        if (edge.visited === id || (edge.gate && edge.gate.open)) continue;
+                        edge.visited = id;
+                        if (this.pushEdge(coin, edge)) pushed = true;
+                    }
+                }
+            }
+            if (!pushed) break;
+        }
+    }
+
+    private pushEdge(coin: DropCoin, edge: Edge): boolean {
+        let along = (coin.x - edge.ax) * edge.tx + (coin.y - edge.ay) * edge.ty;
+        if (along < 0) along = 0;
+        else if (along > edge.length) along = edge.length;
+        const cx = edge.ax + edge.tx * along;
+        const cy = edge.ay + edge.ty * along;
+        let dx = coin.x - cx;
+        let dy = coin.y - cy;
+        const distSq = dx * dx + dy * dy;
+        const radius = coin.radius;
+        if (distSq >= radius * radius) return false;
+        const dist = Math.sqrt(distSq);
+        if (dist > EPSILON) {
+            const scale = (radius + SKIN - dist) / dist;
+            coin.x += dx * scale;
+            coin.y += dy * scale;
+            dx /= dist;
+            dy /= dist;
+        } else {
+            dx = -edge.ty;
+            dy = edge.tx;
+            coin.x += dx * (radius + SKIN);
+            coin.y += dy * (radius + SKIN);
+        }
+        const approach = coin.vx * dx + coin.vy * dy;
+        if (approach < 0) {
+            coin.vx -= approach * dx;
+            coin.vy -= approach * dy;
+        }
+        return true;
+    }
+
     private move(coin: DropCoin, dx: number, dy: number, slide: boolean) {
+        const lengthSq = dx * dx + dy * dy;
+        if (lengthSq < EPSILON) return;
+        // 扫掠圆的外接圆里没有边，就不可能撞上墙或针。
+        const length = Math.sqrt(lengthSq);
+        if (!this.nearEdge(coin.x + dx * 0.5, coin.y + dy * 0.5, coin.radius + length * 0.5)) {
+            coin.x += dx;
+            coin.y += dy;
+            return;
+        }
         for (let i = 0; i < (slide ? 3 : 1); i++) {
             const lengthSq = dx * dx + dy * dy;
             if (lengthSq < EPSILON) break;
